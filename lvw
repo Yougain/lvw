@@ -1,0 +1,2856 @@
+#!/bin/env ruby
+
+require "time"
+require "Yk/path_aux"
+require "Yk/rootexec"
+require 'Yk/TTYStr'
+$debug = false
+require "Yk/debug2"
+require 'fiddle'
+
+END{
+	if `uname -a` =~ /Android/
+		%W{stty  500:5:bf:8a3b:3:1c:7f:15:4:0:1:0:11:0:1a:0:12:f:17:16:0:0:0}.system
+	else
+		%W{stty  500:5:bf:8a3b:3:1c:7f:15:4:0:1:0:11:0:1a:0:12:f:17:16:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0}.system
+	end
+}
+
+p > "./lvw.debug"
+
+HILIGHT_START = "\x1b[7m"
+HILIGHT_END = "\x1b[27m"
+
+opts = []
+argv = []
+ARGV.each do |e|
+	if e =~ /^\-/
+		opts.push e
+	else
+		argv.push e
+	end
+end
+
+
+$watchInterval = 0.2
+
+
+if argv.size == 0
+	if "/var/log/messages"._e?
+		argv.push "messages"
+	elsif "/var/log/syslog"._e?
+		argv.push "syslog"
+	else
+		STDERR.write "usage: #{$0} ITEM ...\n"
+		exit 1
+	end
+end
+
+
+class String
+	def tty_width
+		p
+		ret = 0
+		p
+		each_codepoint do |cp|
+			ret += Yk::TTYStr.ttyWidth cp
+		end
+		ret
+	end
+	def tty_slice pos, len
+		p
+		sz = 0
+		if len > 0
+			codepoints[pos ... size].each_with_index do |cp, i|
+				sz += Yk::TTYStr.ttyWidth cp
+				if sz > len
+					return slice(pos ... pos + i)
+				end
+			end
+			ret = slice(pos ... size)
+		else
+			i = 0
+			codepoints[0 .. pos].reverse_each do |cp|
+				sz += Yk::TTYStr.ttyWidth cp
+				if sz > -len
+					return slice(pos - i + 1 .. pos)
+				end
+				i += 1
+			end
+			ret = slice(0..pos)
+		end
+		return ret ? ret : ""
+	end
+end
+
+#Copyright (C) Codezine http://codezine.jp
+#Copyright (C) Shanghai Institute, 2009
+Thread.abort_on_exception = true
+
+class LPosition
+	attr :x
+	attr :y
+	attr :x2
+	attr :y2
+	def initialize (x, y, x2 = nil, y2 = nil)
+		@x = x
+		@y = y
+		@x2 = x2
+		@y2 = y2
+		x2 == nil && @x2 = x
+		y2 == nil && @y2 = y
+		if @y > @y2 || (@y == @y2 && @x > @x2)
+			raise ArgumentError.new
+		end
+	end
+	def <=> (arg)
+		if (tmp = y <=> arg.y) == 0
+			x <=> arg.x
+		else
+			tmp
+		end
+	end
+	def extendTo (a)
+		LPosition.new(x, y, a.x2, a.y2)
+	end
+	def overlaps? (a)
+		if (y2 < a.y) || (y2 == a.y && x2 <= a.x)
+			return false
+		elsif (a.y2 < y) || (a.y2 == y && a.x2 <= x)
+			return false
+		else
+			return true
+		end
+	end
+	def includes? (a)
+		if y < a.y || (y == a.y && x <= a.x)
+			if a.y2 < y2 || (a.y2 == y2 && a.x2 <= a.x2)
+				return true
+			end
+		end
+		return false
+	end
+end
+class ScrPointer
+	class NumItem
+		def initialize (lNum, sNum, lines, width, height)
+			@lNum = lNum
+			@lines = lines
+			@width = width
+			@height = height
+			if sNum == -1
+				@sNum = @lines[@lNum].formatLineCount(@width) - 1
+			else
+				@sNum = sNum
+			end
+		end
+		def topPos
+			LPosition.new(@lines[@lNum].formatLineTopPos(@width, @sNum), @lNum)
+		end
+		def topPosPrev
+			LPosition.new(@lines[@lNum].formatLineTopPos(@width, @sNum) - 1, @lNum)
+		end
+		def bottomPos
+			LPosition.new(@lines[@lNum].formatLineBottomPos(@width, @sNum), @lNum)
+		end
+		def bottomPosNext
+			LPosition.new(@lines[@lNum].formatLineBottomPos(@width, @sNum) + 1, @lNum)
+		end
+		
+		def formatLineWithHilight pos, mode
+			if pos.y != @lNum
+				return nil
+			else
+				if pos.x2 <= (t = @lines[@lNum].formatLineTopPos(@width, @sNum))
+					return nil
+				elsif (b = @lines[@lNum].formatLineBottomPos(@width, @sNum)) <= pos.x
+					return nil
+				end
+				if mode
+					pos.x < t ? start = t : start = pos.x
+					pos.x2 > b ? ed = b - 1: ed = pos.x2
+					sline = @lines[@lNum].formatLineHilighted @width, @sNum, start, ed
+				else
+					sline, = @lines[@lNum].formatLine @width, @sNum
+				end
+				yield sline
+			end
+		end
+		def _lNum
+			@lNum
+		end
+		def _sNum
+			@sNum
+		end
+		def == (ag)
+			if ag == nil
+				return false
+			end
+			@lNum == ag._lNum && @sNum == ag._sNum
+		end
+		def getNextNumItem
+			if @sNum < @lines[@lNum].formatLineCount(@width) - 1
+				return NumItem.new(@lNum, @sNum + 1, @lines, @width, @height)
+			elsif @lNum < @lines.max
+				return NumItem.new(@lNum + 1, 0, @lines, @width, @height)
+			else
+				return nil
+			end
+		end
+		def getPrevNumItem
+			if @sNum > 0
+				return NumItem.new(@lNum, @sNum - 1, @lines, @width, @height)
+			elsif @lNum > @lines.min
+				nSNum = @lines[@lNum - 1].formatLineCount(@width) - 1
+				return NumItem.new(@lNum - 1, nSNum, @lines, @width, @height)
+			else
+				return nil
+			end
+		end
+		def each_line (cnt)
+			i = 0
+			j = @lNum
+			k = @sNum
+			while true
+				@lines[j].formatLineEach(@width, k) do |ln, k|
+					if i >= cnt
+						return
+					end
+					yield ln, NumItem.new(j, k, @lines, @width, @height)
+					i += 1
+				end
+				if j >= @lines.max
+					return
+				end
+				k = 0
+				j += 1
+			end
+		end
+		def reverse_each_line (cnt)
+			i = 0
+			j = @lNum
+			k = @sNum
+			while true
+				@lines[j].formatLineReverseEach(@width, k) do |ln, k|
+					yield ln, NumItem.new(j, k, @lines, @width, @height)
+					i += 1
+					if i >= cnt
+						return
+					end
+				end
+				if j <= @lines.min
+					return
+				end
+				k = -1
+				j -= 1
+			end
+		end
+		def isLastItem
+			if @lNum >= @lines.max 
+				if @sNum >= @lines[@lNum].formatLineCount(@width) - 1
+					return true
+				end
+			end
+			return false
+		end
+		def isFirstItem
+			if @lNum <= @lines.min
+				if @sNum <= 0
+					return true
+				end
+			end
+		end
+	end
+	attr :numList
+	def initialize (lines, width, height)
+		@lines = lines
+		@width = width
+		@height = height
+		@numList = []
+		@prevIsLast = true
+		@prevIsFirst = true
+	end
+	def doScroll (cnt)
+		sLines = []
+		ret = [0, [], 0]
+		if 0 < cnt && cnt < @height && !numList[-1].isLastItem
+			numListToAdd = []
+			scrNextNumItem = numList[-1].getNextNumItem
+			scrNextNumItem.each_line(cnt) do |ln, numItem|
+				sLines.push ln
+				numListToAdd.push numItem
+			end
+			@numList = @numList[sLines.size ... @numList.size]
+			@numList.push *numListToAdd
+			ret = [sLines.size, sLines, @height - sLines.size]
+		elsif 0 < -cnt && -cnt < @height && !numList[0].isFirstItem
+			numListToAdd = []
+			scrPrevNumItem = numList[0].getPrevNumItem
+			scrPrevNumItem.reverse_each_line(-cnt) do |ln, numItem|
+				sLines.unshift ln
+				numListToAdd.unshift numItem
+			end
+			@numList = @numList[0 ... (@numList.size - sLines.size)]
+			@numList.unshift *numListToAdd
+			ret = [-sLines.size, sLines, 0]
+		elsif cnt == 0
+			scrTopNumItem = nil
+			if @numList.size == 0
+				scrTopNumItem = NumItem.new(@lines.min, 0, @lines, @width, @height) 
+			else
+				scrTopNumItem = @numList[0] 
+			end
+			@numList.clear
+			scrTopNumItem.each_line(@height) do |ln, numItem|
+				sLines.push ln
+				numList.push numItem
+			end
+			ret = [0, sLines, 0]
+		end
+		setPrevStat
+		return ret
+	end
+	def setEnd
+		sLines = []
+		toAdd = []
+		ni = NumItem.new(@lines.max, -1, @lines, @width, @height)
+		ni.reverse_each_line(@height) do |ln, numItem|
+			if numList.size > 0 && numItem == @numList[-1]
+				break
+			end
+			sLines.unshift ln
+			toAdd.unshift numItem
+		end
+		@numList.push *toAdd
+		if @numList.size > @height
+			@numList = @numList[@numList.size - @height .. @numList.size - 1]
+		end
+		setPrevStat
+		return [sLines.size, sLines, @height - sLines.size]
+	end
+	def setComp
+		sLines = []
+		toAdd = []
+		if @numList.size != 0
+			ni = @numList[-1].getNextNumItem
+			oldSz = @numList.size
+			if ni
+			ni.each_line(@height - @numList.size) do |ln, numItem|
+				sLines.push ln
+				toAdd.push numItem
+			end
+			end
+			@numList.push *toAdd
+		else
+			return doScroll(0)
+		end
+		setPrevStat
+		return [0, sLines, oldSz]
+	end
+	def setHome
+		sLines = []
+		toAdd = []
+		ni = NumItem.new(@lines.min, 0, @lines, @width, @height)
+		ni.each_line(@height) do |ln, numItem|
+			if @numList.size > 0 && numItem == @numList[0]
+				break
+			end
+			sLines.push ln
+			toAdd.push numItem
+		end
+		@numList.unshift *toAdd
+		if @numList.size > @height
+			@numList = @numList[0 .. @height - 1]
+		end
+		setPrevStat
+		return [-sLines.size, sLines, 0]
+	end
+	def setLineNum (n)
+		
+		setPrevStat
+	end
+	def setPrevStat
+		@prevIsFirst = @numList[0].isFirstItem
+		@prevIsLast = @numList[-1].isLastItem
+	end
+	def prevIsFirst?
+		@prevIsFirst
+	end
+	def prevIsLast?
+		@prevIsLast
+	end
+	def isFirst?
+		if @numList.size == 0
+			@lines.min == nil || @lines.min >= 0
+		else
+			@numList[0].isFirstItem
+		end
+	end
+	def isLast?
+		if @numList.size == 0
+			@lines.max == nil
+		else
+			@numList[-1].isLastItem
+		end
+	end
+
+	def topPos
+		if @numList.size == 0
+			nil
+		else
+			@numList[0].topPos
+		end
+	end
+	
+	def topPosPrev
+		if @numList.size == 0
+			nil
+		else
+			@numList[0].topPosPrev
+		end
+	end
+	
+	def bottomPosNext
+		if @numList.size == 0
+			nil
+		else
+			@numList[0].bottomPosNext
+		end
+	end
+	
+	def bottomPos
+		if @numList.size == 0
+			nil
+		else
+			@numList[-1].bottomPos
+		end
+	end
+	
+	def setHilightSelection (pos, mode, parent)
+		sels = []
+		if @numList[0].topPos.extendTo(@numList[-1].bottomPos).includes? pos
+			@numList.each_with_index do |e, i|
+				e.formatLineWithHilight pos, mode do |sline|
+					parent.writeLine i, sline
+				end
+			end
+			parent.window.refresh
+			true
+		end
+	end
+	
+	def scrollUntil (pos)
+		ni = NumItem.new(pos.y, @lines[pos.y].formatLineNum(@width, pos.x), @lines, @width, @height)
+		cnt = 0
+		numItems = [tmp2 = tmp1 = ni]
+		while true
+			if tmp2 != nil && (tmp2 = numItems[-1].getNextNumItem) != nil
+				numItems.push tmp2
+				numItems.size >= @height && break
+			end
+			if tmp1 != nil && (tmp1 = numItems[0].getPrevNumItem) != nil
+				numItems.unshift tmp1
+				numItems.size >= @height && break
+			end
+			if tmp2 == nil && tmp1 == nil
+				break
+			end
+		end
+		sLines = []
+		@numList.clear
+		numItems[0].each_line @height do |ln, numItem|
+			sLines.push ln
+			@numList.push numItem
+		end
+		setPrevStat
+		[0, sLines, 0]
+	end
+
+	def has (pos)
+		if pos == nil
+			return false
+		end
+		if @numList.size == 0
+			false
+		else
+			@numList[0].topPos.extendTo(@numList[-1].bottomPos).overlaps? pos
+		end
+	end
+
+end			
+
+
+class SubWind
+	class EditBuff
+		attr :window
+		attr :current
+		attr :prev
+		attr :curPos
+		attr :dispPos
+		def initialize (window)
+			@window = window
+			@width = @window.maxx - 2
+			@current = ""
+			@prev = nil
+			@curPos = 0
+			@dispPos = 0
+			@history = []
+			@histPos = nil
+		end
+		def dispEndPos
+			@current.tty_slice(@dispPos, @width).size + @dispPos
+		end
+		
+		def setCurPos
+			@window.setpos(0, @current[@dispPos ... @curPos].tty_width + 1)
+		end
+		def resetDispPos
+			@window.setpos(0, 0)
+			@window.deleteln
+			@window.addstr("/")
+			s = @current.tty_slice(@dispPos, @width)
+			@window.addstr(s)
+			setCurPos
+		end
+		
+		def resetCur
+			case @curPos
+			when 0 ... @dispPos
+				@dispPos = @curPos
+				resetDispPos
+			when @dispPos ... dispEndPos
+				setCurPos
+			else
+				@dispPos = @curPos - @current.tty_slice(@curPos, -@width).size
+				resetDispPos
+			end
+			@window.refresh
+		end
+		def redisplayAfterCur
+			case @curPos
+			when 0 ... @dispPos
+				@dispPos = @curPos
+			when @dispPos ... dispEndPos
+			else
+				@dispPos = @curPos - @current.tty_slice(@curPos, -@width).size
+			end
+			resetDispPos
+			@window.refresh
+		end
+		def redisplay
+			resetDispPos
+			@window.refresh
+		end
+		def erase
+			@window.deleteln
+			@window.setpos(0, 0)
+			@window.refresh
+		end
+
+		def home
+			@curPos = 0
+			resetCur
+		end
+		def ed
+			@curPos = @current.size
+			resetCur
+		end
+		def left
+			if @curPos != 0
+				@curPos -= 1
+			end
+			resetCur
+		end
+		def right
+			if @curPos != @current.size
+				@curPos += 1
+			end
+			resetCur
+		end
+		
+			def setHistory
+				@current = @history[@histPos]
+				@curPos = @current.size
+				redisplay
+			end
+			def restoreCurrent
+				@current = @preservedCurrent
+				@curPos = @preservedCurPos
+				@preservedCurrent = nil
+				@preservedCurPos = nil
+				redisplay
+			end
+			def preserveCurrent
+				@preservedCurrent = @current
+				@preservedCurPos = @curPos
+			end
+			def addHistory (s)
+				if (pos = @history.index(s)) != nil
+					item = @history.slice! pos
+					@history.push item
+					if @histPos == pos
+						@histPos = @history.size - 1
+					end
+				else
+					@history.push s
+				end
+			end
+			def beforeMod
+				if @histPos != nil
+					@preservedCurrent = nil
+					@preservedCurPos = nil
+					item = @history.slice! @histPos
+					@history.push item
+					@histPos = nil
+					@current = @current.clone
+					@prev = nil
+				else
+					@prevCurrent = nil
+				end
+			end
+
+		def bs
+			if @curPos >= 1
+				beforeMod
+				if @prev == nil
+					@prev = @current.clone
+				end
+				@current.slice!(@curPos - 1)
+				@curPos -= 1
+				redisplayAfterCur
+			elsif @curPos == 0
+				del
+			end
+		end
+		def del
+			if @current.size > 0
+				beforeMod
+				if @prev == nil
+					@prev = @current.clone
+				end
+				@current.slice!(@curPos)
+				redisplayAfterCur
+			end
+		end
+		def char (c)
+			beforeMod
+			@prev = nil
+			@current.insert(@curPos, c.chr)
+			@curPos += 1
+			redisplayAfterCur
+		end
+
+		def ret
+			addHistory @current.clone
+		end
+		def up
+			if @histPos == nil
+				if @prev != nil
+					tmp = @current
+					@current = @prev
+					@prev = nil
+					@prevCurrent = tmp
+					@curPos = @current.size
+					redisplay
+				elsif @history.size > 0
+					preserveCurrent
+					@histPos = @history.size - 1
+					setHistory
+				end
+			else
+				if  @histPos != 0
+					@histPos -= 1
+					setHistory
+				end
+			end
+		end
+		def down
+			if @histPos != nil
+				if @histPos != @history.size - 1
+					@histPos += 1
+					setHistory
+				else
+					@histPos = nil
+					restoreCurrent
+				end
+			elsif @prevCurrent != nil
+				@prev = @current
+				@current = @prevCurrent
+				@prevCurrent = nil
+				@curPos = @current.size
+				redisplay
+			end
+		end
+		def pageup
+			if @history.size > 0
+				if @histPos == nil
+					preserveCurrent
+				end
+				if @histPos != 0
+					@histPos = 0
+					setHistory
+				end
+			end
+		end
+		def pagedown
+			if @histPos != nil
+				@histPos = nil
+				restoreCurrent
+			end
+		end
+		
+		def isEmpty?
+			@current.size == 0
+		end
+
+	end
+	def initialize (wind)
+		@width = wind.maxx
+		@window = wind._subwin(1, wind.maxx, wind.maxy - 1, 0)
+		@main = wind
+		@editBuff = EditBuff.new(@window)
+	end
+	attr :editBuff
+	attr :mainWind, true
+	def resetCur
+		editBuff.resetCur
+	end
+	def keyLoop
+		editBuff.redisplay
+		while true
+			case tmp = yield
+			when :bs, :del
+				if editBuff.isEmpty?
+					#editBuff.prevToHistory
+					editBuff.erase
+					return :quit
+				else
+					editBuff.method(tmp).call
+				end
+			when :ret
+				if !editBuff.isEmpty?
+					mainWind.searchStr = editBuff.current
+					mainWind.search
+					editBuff.method(tmp).call
+					editBuff.erase
+					return :quit
+				end
+			else
+				if tmp.is_a? Symbol
+					editBuff.method(tmp).call
+				else
+					editBuff.char(tmp)
+				end
+			end
+		end
+	end
+end
+
+
+require 'ncursesw'
+
+
+
+class MainWind
+
+	def initialize (wind, lines, swind)
+		# デフォルトウィンドウの高さを少し小さくしたサブウィンドウを作成
+		@window = wind._subwin(wind.maxy - 1, wind.maxx, 0, 0)
+		# スクロール機能をONにする
+		@window.scrollok(true)
+		@sub_wind = swind
+		@scrPointer = ScrPointer.new(lines, wind.maxx - 1, wind.maxy - 1)
+		@endPressed = false
+		@lines = lines
+		@m = Monitor.new
+	end
+
+	attr_reader :window
+	attr :searchStr, true
+
+	def synchronize
+		@m.synchronize do
+			yield
+		end
+	end
+
+	def onChange
+		synchronize do
+			if @lines.size == 0
+				return
+			end
+			firstChanged = @scrPointer.prevIsFirst? && !@scrPointer.isFirst?
+			lastChanged  = @scrPointer.prevIsLast? && !@scrPointer.isLast?
+			if firstChanged
+				toHome
+			end
+			if lastChanged
+				if !@endPressed
+					toComp
+				else
+					toEnd
+				end
+			end
+		end
+	end
+
+
+	def refresh
+		scroll(0)
+	end
+
+
+
+	def setCurseAttr pn
+		pn.split /;/ do |ep|
+			i = Ncurses::PNFs.index(ep)
+			if !i
+				i = Ncurses::PNBs.index(ep)
+				if i
+					bg = true
+				else
+					next
+				end
+			end
+			if i < 8
+				if !bg
+					c = Ncurses::NColFs[i]
+				else
+					c = Ncurses::NColBs[i]
+				end
+				@window.attron c
+			elsif i == 9
+				@window.attron Ncurses::NColDef
+			elsif i == 0
+				(10..19).each do |e|
+					a = Ncurses::CAttr[e]
+					@window.attroff a if a
+				end
+			else
+				i -= 10 if i >= 20
+				a = Ncurses::CAttr[i]
+				if !bg
+					@window.attron a if a
+				else
+					@window.attroff a if a
+				end
+			end
+		end
+	end
+
+	def writeLine y, ln
+		@window.setpos(y, 0)
+		while ln =~ /\x1b\[((\d+)(;\d+)*)./
+			@window.addstr($`)
+			setCurseAttr($1)
+			ln = $'
+		end
+		@window.addstr(ln)
+	end
+
+	def buildScreen (nScr, sLines, compTop)
+		Thread.current.priority = -20
+		$thread_slow_down = true
+		if nScr != 0
+			@window.scrl(nScr)
+		end
+		i = 0
+		sLines.each do |ln|
+			writeLine compTop + i, ln
+			i += 1
+		end
+		@window.refresh
+		$thread_slow_down = false
+	end
+
+	# スクロール
+	def scroll (num)
+		synchronize do
+			if @lines.size != 0
+				buildScreen *@scrPointer.doScroll(num)
+				if !@scrPointer.has(@srchPos)
+					@srchPos = nil
+				end
+			end
+			if num > 0 && @scrPointer.isLast?
+				@endPressed = true
+			else
+				@endPressed = false
+			end
+		end
+	end
+
+	def pageup
+		scroll(- @window.maxy + 2)
+	end
+
+	def pagedown
+		scroll(@window.maxy - 2)
+	end
+
+	def toHome
+		synchronize do
+			if @lines.size != 0
+				buildScreen *@scrPointer.setHome
+				if !@scrPointer.has(@srchPos)
+					@srchPos = nil
+				end
+			end
+			@endPressed = false
+		end
+	end
+
+	def toEnd
+		synchronize do
+			if @lines.size != 0
+				buildScreen *@scrPointer.setEnd
+				if !@scrPointer.has(@srchPos)
+					@srchPos = nil
+				end
+			end
+			@endPressed = true
+		end
+	end
+
+	def toComp
+		synchronize do
+			if @lines.size != 0
+				buildScreen *@scrPointer.setComp
+				if !@scrPointer.has(@srchPos)
+					@srchPos = nil
+				end
+			end
+		end
+	end
+	
+	def doSearch (expr)
+		@scrPointer.setHilightSelection @prevSrchPos, false, self if @prevSrchPos
+		if (tmp = @lines[@srchPos.y].content.index(expr, @srchPos.x + 1)) != nil
+			@srchPos = LPosition.new(tmp, @srchPos.y, tmp + $&.size - 1)
+			return @srchPos
+		end
+		checkLineFrom = Proc.new do |lno|
+			(lno .. @lines.max).each do |i|
+				if (tmp = @lines[i].content.index(expr)) != nil
+					@srchPos = LPosition.new(tmp, i, tmp + $&.size - 1)
+					return @srchPos
+				end
+			end
+		end
+		if @srchPos.y < @lines.max
+			checkLineFrom.call(@srchPos.y + 1)
+		end
+		checkLineFrom.call(@lines.min)
+		return @srchPos = nil
+	end
+	
+	def doRevSearch (expr)
+		s = @scrPointer.setHilightSelection @prevSrchPos, false, self if @prevSrchPos
+		if (@srchPos.x - 1 >= 0) && (tmp = @lines[@srchPos.y].content.rindex(expr, @srchPos.x - 1)) != nil
+			@srchPos = LPosition.new(tmp, @srchPos.y, tmp + $&.size - 1)
+			return @srchPos
+		end
+		checkLineFrom = Proc.new do |lno|
+			lno.downto @lines.min do |i|
+				if (tmp = @lines[i].content.rindex(expr)) != nil
+					@srchPos = LPosition.new(tmp, i, tmp + $&.size - 1)
+					return @srchPos
+				end
+			end
+		end
+		if @srchPos.y > @lines.min
+			checkLineFrom.call(@srchPos.y - 1)
+		end
+		checkLineFrom.call(@lines.max)
+		return @srchPos = nil
+	end
+	
+
+	def search (direction = true)
+		if @searchStr == nil
+			scroll(1)
+			return
+		end
+		r = Regexp.new(@searchStr) rescue return
+		synchronize do
+			if @lines.size != 0
+				if direction
+					cnd = (@srchPos ||= @scrPointer.topPosPrev) != nil && doSearch(r) != nil
+				else
+					cnd = (@srchPos ||= @scrPointer.bottomPosNext) != nil && doRevSearch(r) != nil
+				end
+				if cnd
+					while true
+						found = @scrPointer.setHilightSelection @srchPos, true, self
+						@sub_wind.resetCur
+						if !found
+							p
+							buildScreen *@scrPointer.scrollUntil(@srchPos)
+							p
+						else
+							@prevSrchPos = @srchPos
+							break
+						end
+					end 
+				end
+			end
+		end
+	end
+
+	def getch
+		r = @window.getch
+		p r.to_s(16)
+		r
+	end
+
+	def execute (cmd)
+  		# コマンド入力を処理
+		case cmd
+		when :refresh
+			scroll(0)
+		when :down
+			scroll(1)
+		when :pagedown # カーソルを下へ
+			pagedown
+		when :up
+			scroll(-1)
+		when :pageup
+			pageup
+		when :home
+			toHome
+		when :ed
+			toEnd
+		when :change
+			onChange
+		when :ret
+			search
+		when "\x09"
+			search
+		when "\x06"
+			search
+		when :shift_tab, "\x07"
+			search(false)
+		end
+	end
+
+end
+
+#require 'monitor'
+require 'ncursesw'
+
+
+
+module Ncurses
+	PNFs = %W{30 31 32 33 34 35 36 37 48 49 0 1 2 3 4 5 6 7 8 9 20 21 }
+	PNBs = %W{40 41 42 43 44 45 46 47 48 49 0 1 2 3 4 5 6 7 8 9 20 21 22 23 24 25 26 27 28 29}
+	Cols = %W{Black Red Green Yellow Blue Purple Cyan White Unknown Default
+				Underline
+				Bold 
+				Thin 
+				Italic 
+				Underline
+				Blink
+				Fastblink 
+				Reverse 
+				Hidden
+				Strike
+				Fraktur
+				DoubleUnder
+				ThinOff
+				ItalicOff
+				UnderlineOff
+				BlinkOff
+				FastblinkOff
+				ReverseOff
+				HiddenOff
+				StrikeOff
+			}
+	CAttr = [	COLOR_BLACK,
+				COLOR_RED,
+				COLOR_GREEN,
+				COLOR_YELLOW,
+				COLOR_BLUE,
+				COLOR_MAGENTA,
+				COLOR_CYAN,
+				COLOR_WHITE,
+				nil, # unknown
+				nil, # default
+				nil, # clear
+				WA_BOLD,
+				WA_DIM,
+				1 << 23, # A_ITALIC
+				WA_UNDERLINE,
+				WA_BLINK,
+				nil,
+				WA_REVERSE,
+				WA_INVIS,
+				nil
+			]
+	def _init_colors
+		start_color
+		use_default_colors
+		init_pair(1, COLOR_BLACK, -1)
+		init_pair(2, COLOR_RED, -1)
+		init_pair(3, COLOR_GREEN, -1)
+		init_pair(4, COLOR_YELLOW, -1)
+		init_pair(5, COLOR_BLUE, -1)
+		init_pair(6, COLOR_MAGENTA, -1)
+		init_pair(7, COLOR_CYAN, -1)
+		init_pair(8, COLOR_WHITE, -1)
+		init_pair(9, -1, COLOR_BLACK)
+		init_pair(10, -1, COLOR_RED)
+		init_pair(11, -1, COLOR_GREEN)
+		init_pair(12, -1, COLOR_YELLOW)
+		init_pair(13, -1, COLOR_BLUE)
+		init_pair(14, -1, COLOR_MAGENTA)
+		init_pair(15, -1, COLOR_CYAN)
+		init_pair(16, -1, COLOR_WHITE)
+		init_pair(17, -1, -1)
+		if NColFs.size == 0
+			(1..8).each do |i|
+				NColFs.push COLOR_PAIR(i)
+			end
+			(9..16).each do |i|
+				NColBs.push COLOR_PAIR(i)
+			end
+		end
+	end
+
+	NColFs = [ ]
+	NColBs = [ ]
+
+	class << self
+		alias org_initscr initscr
+	end
+	def _set_maxxy w
+		x = []
+		y = []
+		w.getmaxyx y, x
+		w.__defun__ :maxx, x[0]
+		w.__defun__ :maxy, y[0]
+		w
+	end
+	NDefWin = initscr
+	NColDef = COLOR_PAIR(17)
+	module_function :_set_maxxy, :_init_colors
+	_set_maxxy NDefWin
+	_init_colors
+#	def initscr *args
+#		p
+#		w = org_initscr *args
+#		p
+#		_set_maxxy w
+#	end
+	def initscr
+		NDefWin
+	end
+	module_function :initscr
+	class WINDOW
+		def _subwin *args
+			w = subwin *args
+			Ncurses._set_maxxy w
+		end
+		def setpos x, y
+			move x, y
+		end
+	end
+end
+
+def n_subwin *args
+	w = args.shift
+	s = w.subwin *args
+	_set_maxxy s
+end
+
+class NcursesCon
+	def terminated?
+		@terminated
+	end
+	def initialize (lines)
+		p
+		@terminated = false
+		@m = Monitor.new
+		@killed = false
+		@thread = Thread.new do
+			#コンソール画面を初期化し初期設定を行う
+			Ncurses.initscr	
+			Ncurses.cbreak
+			Ncurses.noecho
+			# デフォルトウィンドウを取得
+			@defo_wind = Ncurses.initscr
+			# 編集エリアウィンドウを作成
+			@sub_wind = SubWind.new(@defo_wind)
+			@edit_wind = MainWind.new(@defo_wind, lines, @sub_wind)
+			@sub_wind.mainWind = @edit_wind
+			# ファイルをオープンし内容を編集エリアに表示する
+			@edit_wind.execute :refresh
+			@terminated = false
+			@notifier = Thread.current
+			Thread.new do
+				keyLoop do
+					getKey
+				end
+				@terminated = true
+				@notifier.run
+				@notifier.join
+				Ncurses.endwin
+			end
+#			trap :INT do kill end
+			trap :TERM do kill end
+			while true
+				@terminated && break
+				sleep 0.5
+				@terminated && break
+				@edit_wind.execute :change
+			end
+			#コンソール画面を終了
+		end
+	end
+	def kill
+		if !@killed
+			@killed =true
+			stopKeyLoop
+		end
+	end
+	def join
+		@thread.join
+	end
+    ESC_NO = { "1" => :home, "4" => :ed, "3" => :del, "5" => :pageup, "6" => :pagedown }
+    def getKey
+		loop do
+	        ch = @edit_wind.getch #１文字入力
+    	    case ch
+        	when 0x1b
+	            ch2 = @edit_wind.getch #１文字入力。
+    	        case ch2
+        	    when ?[.ord
+            	    ch3 = @edit_wind.getch #１文字入力。
+	                case ch3
+    	            when ?A.ord
+        	            ch = :up
+	                when ?B.ord
+    	                ch = :down
+        	        when ?C.ord
+	                    ch = :right
+    	            when ?D.ord
+        	            ch = :left
+					when ?Z.ord
+						ch = :shift_tab
+	                when ?0.ord .. ?9.ord
+    	                s = ch3.chr
+        	            while true
+            	            chx = @edit_wind.getch
+                	        if chx == ?~.ord || s.size >= 2
+                    	        break
+	                        end
+    	                    s += chx.chr
+        	            end
+	                    ch = ESC_NO[s]
+						next if !ch
+	                end
+	            end
+    	    when ?\n.ord
+        	    ch = :ret
+	        when ?\r.ord
+    	        ch = :ret
+	        when 0x7f
+    	        ch = :bs
+			else #unicodeの処理
+				if ch < 0x80
+					ch = ch.chr
+				elsif ch < 0xc0
+					next
+				elsif ch < 0xe0
+					ch2 = @edit_wind.getch
+					if 0x80 <= ch2 && ch2 < 0xc0
+						s = [ch, ch2].pack("C*").force_encoding(Encoding::UTF_8)
+						return s
+					else
+						next
+					end
+				elsif ch < 0xf0
+					ch2 = @edit_wind.getch
+					if 0x80 <= ch2 && ch2 < 0xc0
+						ch3 = @edit_wind.getch
+						if 0x80 <= ch3 && ch3 < 0xc0
+							s = [ch, ch2, ch3].pack("C*").force_encoding(Encoding::UTF_8)
+							return s
+						else
+							next
+						end
+					else
+						next
+					end
+				elsif ch < 0xf8
+					ch2 = @edit_wind.getch
+					if 0x80 <= ch2 && ch2 < 0xc0
+						return ch.chr + ch2.chr
+						ch3 = @edit_wind.getch
+						if 0x80 <= ch3 && ch3 < 0xc0
+							return ch.chr + ch2.chr + ch3.chr
+						else
+							ch4 = @edit_wind.getch
+							if 0x80 <= ch4 && ch4 < 0xc0
+								s = [ch, ch2, ch3, ch4].pack("C*").force_encoding(Encoding::UTF_8)
+								return s
+							else
+								next
+							end
+						end
+					else
+						next
+					end
+				else
+					next
+				end
+	        end
+			p ch
+        	return ch
+		end
+    end
+	def keyLoop
+		@keyLoopThread = Thread.new do
+			begin
+			while true
+				case cmd = yield
+				when ?q
+					break
+				when ?/
+					@sub_wind.keyLoop do
+						yield
+					end
+				else
+					@edit_wind.execute cmd
+				end
+			end
+			rescue Exception
+				STDERR.write $!.to_s.ln
+				STDERR.write $!.backtrace_locations.join("\n").ln
+				exit 1
+			end
+		end
+		@keyLoopThread.join
+	end
+
+	def stopKeyLoop
+		@edit_wind.synchronize do
+			@keyLoopThread.kill
+		end
+	end
+
+end
+
+
+TERMUX_PATH = "/data/data/com.termux/files"
+
+SEARCH_PATH = ["/var/log", "/var/service_log", TERMUX_PATH + "/usr/var/log/sv", TERMUX_PATH + "/usr/var/service", TERMUX_PATH + "/usr/var/log", "./"]
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+		  "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+          "Januruary", "February", "March", "April", "May", "June", "July", "August", "September", 
+          "October", "November", "December",
+		  "JANURUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER",
+		  "OCTOBER", "NOVEMBER", "DECEMBER"]
+WDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+		 "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN",
+		 "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+		 "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"
+		]
+
+
+Thread::abort_on_exception = true
+TFMT = "%a %y-%m-%d %H:%M:%S"
+TFMT_SIZE = "--- -------- --:--:--.---".size
+
+
+def tfmt(t)
+	if t == Time.at(0)
+		return "--- -------- --:--:--.---"
+	elsif t == "same" || t == ""
+		return "                         "
+	end
+	ret = t.strftime(TFMT) + "."
+	us = (t.usec / 1000).to_i.to_s
+	ret += "0" * (3 - us.size) + us
+end
+
+
+def getTai64NSec (d)
+	if d =~ /\@[0-9a-f]{24}/
+		str = $&
+		content = $'
+		sec = str.slice(2, 15)
+		nanosec = str.slice(17..23)
+		if str[1].chr.to_i >= 4
+			sec = (4 - str[1].chr.to_i).to_s + sec
+		end
+		low = sec.slice(8...16).to_i(16)
+		up = sec.slice(0...8).to_i(16)
+		sub = nanosec.to_i(16)
+		Time.at(low - 10, sub.to_f / 1000 * 16)
+	else
+		nil
+	end
+end
+
+
+class TimeTokenizer
+	Number = 1
+	Month = 2
+	Wday = 3
+	ZDiff = 4
+	Ampm = 5
+	Year = 6
+	ZName = 7
+	class Token
+		attr :tokenizer
+		attr :used
+		attr :kind
+		attr :phrase
+		def setUsed
+			@used = true
+			self
+		end
+		def isUsed?
+			@used 
+		end
+		def initialize (str, leftSepPos, phrasePos, rightSepPos, mode)
+			@str = str
+			@kind = mode
+			@leftSepPos = leftSepPos
+			@rightSepPos = rightSepPos
+			@phrasePos = phrasePos
+			@setUsed = false
+			@phrase = @str[phrasePos...rightSepPos]
+		end
+		def to_s
+			case @kind
+				when Number
+					if phrase.size == 1
+						"0" + phrase
+					else
+						phrase
+					end
+				when Month
+					MONTHS[MONTHS.index(phrase) % 12]
+				when Wday
+					WDAYS[WDAYS.index(phrase) % 7]
+				when Ampm, Year
+					phrase.upcase
+				when ZName
+					if phrase == DZNAME
+						DZDIFF
+					else
+						begin
+							d = DateTime.parse("2000-1-1 1:00 #{phrase}").to_s
+							if d =~ /((\+|\-)\d\d)(\d\d)/
+								"#{$1}:#{$2}"
+							else
+								DZDIFF
+							end
+						rescue
+							DZDIFF
+						end
+					end
+				when ZDiff
+					phrase =~ /^(\+|\-)(\d{1,2})(|:\d\d|\d\d)$/
+					s, h, m = $1, $2, $3
+					if m.size == 3
+						m = m[1..2]
+					end
+					if m.size == 0
+						m = "00"
+					end
+					if h.size < 2
+						h = "0" + h
+					end
+					"#{s}#{h}:#{m}"
+			end
+		end
+		def rightSepToEnd
+			@str[@rightSepPos...@str.size]
+		end
+		def leftSepToEnd
+			@str[@leftSepPos...@str.size]
+		end
+		def startToLeftSep
+			@str[0...@phrasePos]
+		end
+	end
+	def initialize (str)
+		@str = str.clone
+	end
+	def each
+		i = 0
+		leftSepPos = 0
+		phrasePos = nil
+		while i < @str.size
+			while i < @str.size
+				if !"[(])\t \n\r,".include?(@str[i..i])
+					phrasePos = i
+					break
+				end
+				i += 1
+			end
+			if phrasePos == nil
+				return
+			end
+			while i < @str.size
+				if "[(])\t \n\r,".include?(@str[i..i])
+					i -= 1
+					break
+				end
+				i += 1
+			end
+			i = rightSepPos = i + 1
+			tokens = Token.createTokens(@str, leftSepPos, phrasePos, rightSepPos)
+			if tokens.size == 0
+				return
+			else
+				tokens.each do |t|
+					yield t
+				end
+			end
+			leftSepPos = rightSepPos
+		end
+	end
+	def reverse_each
+		i = @str.size - 1
+		rightSepPos = nil
+		while i >= 0
+			if !"[()]\t \n\r,".include?(@str[i..i])
+				rightSepPos = i + 1
+				break
+			end
+			i -= 1
+		end
+		if rightSepPos == nil
+			return
+		end
+		while i >= 0
+			phrasePos = nil
+			while i >= 0
+				if "[()]\t \n\r,".include?(@str[i..i])
+					break
+				end
+				i -= 1
+			end
+			phrasePos = i + 1
+			leftSepPos = nil
+			while i >= 0
+				if !"[()]\t \n\r,".include?(@str[i..i])
+					leftSepPos = i + 1
+					break
+				end
+				i -= 1
+			end
+			if leftSepPos == nil
+				leftSepPos = phrasePos
+			end
+			tokens = Token.createTokens(@str, leftSepPos, phrasePos, rightSepPos)
+			if tokens.size == 0
+				return
+			else
+				tokens.reverse_each do |t|
+					yield t
+				end
+			end
+			rightSepPos = leftSepPos
+		end
+	end
+	def Token.create (str, leftSepPos, phrasePos, rightSepPos)			
+		case tmp = str[phrasePos ... rightSepPos]
+			when /^(\+|\-)\d{1,2}(|\d\d|:\d\d)$/
+				return Token.new(str, leftSepPos, phrasePos, rightSepPos, ZDiff)
+			when /^(19|20)\d\d$/
+				return Token.new(str, leftSepPos, phrasePos, rightSepPos, Year)
+			when /^\d{1,2}$/
+				return Token.new(str, leftSepPos, phrasePos, rightSepPos, Number)
+			when /^(AM|PM)$/
+				return Token.new(str, leftSepPos, phrasePos, rightSepPos, Ampm)
+			else
+				if MONTHS.include? tmp
+					return Token.new(str, leftSepPos, phrasePos, rightSepPos, Month)
+				elsif WDAYS.include? tmp
+					return Token.new(str, leftSepPos, phrasePos, rightSepPos, Wday)
+				elsif tmp =~ /^(UTC|[A-Z][A-Z]T)$/
+					return Token.new(str, leftSepPos, phrasePos, rightSepPos, ZName)
+				else
+					return nil
+				end
+		end
+	end
+	def Token.createTokens (str, leftSepPos, phrasePos, rightSepPos)			
+		isPhrase = true
+		phrase = []
+		prevColonPos = phrasePos - 1
+		(phrasePos ... rightSepPos).each do |i|
+			if "-:/".include?(str[i..i])
+				if i == phrasePos || i == rightSepPos - 1 || prevColonPos == i - 1
+					isPhrase = false
+					break
+				end
+				if prevColonPos == phrasePos - 1
+					token = Token.create(str, leftSepPos, phrasePos, i)
+				else
+					token = Token.create(str, prevColonPos, prevColonPos + 1, i)
+				end
+				if token == nil
+					isPhrase = false
+					break
+				end
+				phrase.push token
+				prevColonPos = i
+			end
+		end
+		if isPhrase
+			if prevColonPos == phrasePos - 1
+				token = Token.create(str, leftSepPos, phrasePos, rightSepPos)
+			else
+				token = Token.create(str, prevColonPos, prevColonPos + 1, rightSepPos)
+			end
+			if token == nil
+				isPhrase = false
+			else
+				phrase.push token
+			end
+		end
+		if isPhrase
+			return phrase
+		else
+			return []
+		end
+	end
+end
+
+
+def cat (a, b)
+	if b =~ /^[\t ]+/
+		b = $'
+	end
+	if a =~ /\s+$/
+		a = $`
+	end
+	a + " " + b
+end
+
+
+def p2 (x)
+	Kernel.p x
+end
+
+
+class Cue
+	def initialize
+		@arr = []
+	end
+	def push (*items)
+		@arr.push *items
+	end
+	def shifts
+		tmp = @arr
+		@arr = []
+		tmp
+	end
+	def shift_lefts
+		tmp = @arr
+		@arr = []
+		tmp
+	end
+end
+
+
+class CueM < Cue
+	def initialize (*cList)
+		@cList = []
+		cList.each do |e|
+			@cList.push e.new
+		end
+	end
+	def push (*items)
+		@cList[0].push *items
+	end
+	def shifts
+		sList = nil
+		@cList.each do |e|
+			if sList != nil
+				e.push *sList
+			end
+			sList = e.shifts
+			if sList.size == 0
+				return sList
+			end
+		end
+		return sList
+	end
+	def shift_lefts
+		sList = nil
+		@cList.each do |e|
+			if sList != nil
+				e.push *sList
+			end
+			sList = e.shifts
+			sList.push *e.shift_lefts
+		end
+		return sList
+	end
+end
+
+
+
+class TimedContent
+	attr :content, true
+	attr :repeat, true
+	attr :time, true
+	attr :revGen
+	class TTYInfo
+		SIZEOF_SIZE_T = Fiddle::SIZEOF_SIZE_T
+		FMT = case SIZEOF_SIZE_T 
+		when Fiddle::SIZEOF_CHAR
+			"C*"
+		when Fiddle::SIZEOF_SHORT
+			"S!*"
+		when Fiddle::SIZEOF_INT
+			"I!*"
+		when Fiddle::SIZEOF_LONG
+			"L!*"
+		when Fiddle::SIZEOF_LONG_LONG
+			"Q!*"
+		end
+		attr_reader :formatLineCount
+		def getCPPos cpPosList, i
+			cpPosList[i * SIZEOF_SIZE_T .. (i + 1) * SIZEOF_SIZE_T - 1].unpack(FMT)[0]
+		end
+		def initialize w, tc
+			@timedContent = tc
+			@width = w
+			tstr = Yk::TTYStr.new(tc.content)
+			@formatLineCount = 0
+			@formatLineBottomPos = []
+			@formatLinePadNums = []
+			@formatLines = []
+			@formatLineCPPosLists = []
+			
+			tstr.each_line w - @timedContent.tfmtSize - @timedContent.idSize - 1, 8, "", 0 do |ln, pad_num, cpPosList|
+				p ln
+				p pad_num
+				p cpPosList
+				ln.force_encoding(Encoding::UTF_8)
+				cpPosList.force_encoding(Encoding::BINARY)
+				@formatLineBottomPos.push(getCPLastPos(cpPosList) + 1)
+				@formatLinePadNums.push pad_num
+				@formatLineCount += 1
+				@formatLines.push ln
+				@formatLineCPPosLists.push cpPosList
+			end
+		end
+		def getCPLastPos cpPosList
+			getCPPos cpPosList, -1
+		end
+		def indexOfCPPosList cpPosList, start, ed
+			tmp = cpPosList.unpack(FMT)
+			ret = [start, ed].map do |e|
+				tmp.index(e)
+			end
+			ret
+		end
+		def formatLineNum x
+			@formatLineBottomPos.each_with_index do |bp, i|
+				if x < bp
+					return i
+				end
+			end	
+		end
+		def formatLineTopPos s
+			if s == 0
+				0
+			else
+				@formatLineBottomPos[s - 1]
+			end
+		end
+		def formatLineBottomPos s
+			@formatLineBottomPos[s]
+		end
+		def getTop k
+			if k == 0
+				@timedContent.tfmt + "|" + @timedContent.id
+			else
+				@timedContent.tfmtDummy + "+" + @timedContent.idBlank
+			end
+		end
+		def formatLine k
+			ln = @formatLines[k]
+			top = getTop k
+			[top + ln, k]
+		end
+		def formatLineSubPos k, start, ed
+			indexOfCPPosList(@formatLineCPPosLists[k], start, ed)
+		end
+		def formatLineHilighted k, start, ed
+			ret = getTop k
+			s, e = formatLineSubPos k, start, ed
+			if s && e
+				ln = @formatLines[k]
+				if s > 0
+					ret += ln[0..s - 1]
+				end
+				ret += HILIGHT_START + ln[s..e] + HILIGHT_END
+				if e < ln.size - 1
+					ret += ln[e + 1.. -1]
+				end
+			end
+			ret
+		end
+		def formatLineEach s
+			(s...@formatLineCount).each do |k|
+				yield *formatLine(k)
+			end
+		end
+		def formatLineReverseEach s
+			if s == -1
+				s = @formatLineCount - 1	
+			end
+			s.downto 0 do |k|
+				yield *formatLine(k)
+			end
+		end
+	end
+
+	def initialize (c, t, r)
+		@content = c
+		if c =~ /^\s*[\w.]+(\-[\w.]+)*(\[\d+\]|):\s/
+			@id = $&
+			@content = $'
+		else
+			@id = ""
+			@content = c
+		end
+		@time = t
+		@repeat = 1
+		@revGen = r
+		@ttyInfoCache = Hash.new{ |h, k| h[k] = TTYInfo.new k, self }
+	end
+	def tfmtSize
+		tfmt.size
+	end
+	def idSize
+		@id.tty_width
+	end
+	def id
+		@id
+	end
+	def idBlank
+		" " * idSize
+	end
+	TN = Time.now
+	@@ufmt = ""
+	WDAY2 = %W{Su Mo Tu We Th Fr Sa}
+	def tfmt
+		if !@tfmt
+			if @time.usec != 0
+				@@ufmt = ".%3N"
+			end
+			if TN.year != @time.year
+				tf = WDAY2[@time.wday] + " " + @time.strftime("%y-%m-%d %H:%M:%S" + @@ufmt)
+			elsif TN.mon != @time.mon
+				tf = WDAY2[@time.wday] + " " + @time.strftime("%m-%d %H:%M:%S" + @@ufmt)
+			elsif TN.day != @time.day
+				tf = WDAY2[@time.wday] + " " + @time.strftime("%d %H:%M:%S" + @@ufmt)
+			elsif TN.hour != @time.hour
+				tf = @time.strftime("%H:%M:%S" + @@ufmt)
+			elsif TN.min != @time.min
+				tf = @time.strftime("%M:%S" + @@ufmt)
+			else
+				tf = @time.strftime("%S" + @@ufmt)
+			end
+			@tfmt = tf
+		end
+		if @time.respond_to? :same
+			" " * @tfmt.size
+		else
+			@tfmt
+		end
+	end
+	def tfmtDummy
+		" " * tfmt.size
+	end
+	def <=> (ag)
+		ag.time <=> time
+	end
+	def formatLineCount (w)
+		@ttyInfoCache[w].formatLineCount
+	end
+	def formatLineTopPos (w, s)
+		@ttyInfoCache[w].formatLineTopPos s
+	end
+	def formatLineNum (w, x)
+		@ttyInfoCache[w].formatLineNum x
+	end
+	def formatLineBottomPos (w, s)
+		@ttyInfoCache[w].formatLineBottomPos s
+	end
+	def formatLineEach (w, s)
+		@ttyInfoCache[w].formatLineEach s do |ln, k|
+			yield ln, k
+		end
+	end
+	def formatLineHilighted w, s, start, ed
+		@ttyInfoCache[w].formatLineHilighted s, start, ed
+	end
+	def formatLine w, s
+		@ttyInfoCache[w].formatLine s
+	end
+	def formatLineReverseEach (w, s)
+		@ttyInfoCache[w].formatLineReverseEach s do |ln, k|
+			yield ln, k
+		end
+	end
+	
+	class CueSameMsg < Cue
+		def shifts
+			retArr = []
+			idx = 0
+			while idx + 1 < @arr.size
+				if @arr[0].content != @arr[idx + 1].content || @arr[0].revGen != @arr[idx + 1].revGen
+					if idx != 0
+						r = 0
+						(0 .. idx).each do |i|
+							r += @arr[i].repeat
+						end
+						r -= 1
+						if r == 1
+							@arr[0].content = " last message repeated once again."
+						elsif r == 2
+							@arr[0].content = " last message repeated twice."
+						else
+							@arr[0].content = " last message repeated #{r} times."
+						end
+						retArr.push @arr[0], @arr[idx]
+					else
+						retArr.push @arr[0]
+					end
+					@arr.slice!(0 .. idx) 
+					idx = 0
+				end
+				idx += 1
+			end
+			if @arr.size >= 2
+				r = 0
+				@arr.each do |e|
+					r += e.repeat
+				end
+				@arr[0].repeat = r - 1
+				@arr[-1].repeat = 1
+				@arr = [@arr[0], @arr[-1]]
+			end
+			return retArr
+		end
+	end
+
+	class CueSameTime < Cue
+		def shifts
+			idx = 0
+			retArr = []
+			while idx + 1 < @arr.size
+				if (@arr[0].time - @arr[idx + 1].time).abs > 0.001
+					tmpArr = []
+					if idx != 0
+						(0..idx - 1).each do |i|
+#							@arr[i].time = "same"
+							@arr[i].time.__defun__ :same, true
+							tmpArr.unshift @arr[i]
+						end
+					end
+					tmpArr.unshift @arr[idx]
+					retArr.push *tmpArr
+					@arr.slice!(0 .. idx) 
+					idx = 0
+				end
+				idx += 1
+			end
+			return retArr
+		end
+	end
+
+	@@cuef = CueM.new(CueSameMsg, CueSameTime)
+	@@cueb = CueM.new(CueSameMsg, CueSameTime)
+	def TimedContent.cuef
+		@@cuef
+	end
+	def TimedContent.cueb
+		@@cueb
+	end
+
+end
+		
+
+BTIME = Time.at(`grep btime /proc/stat|cut -b7-`.to_i)
+
+
+def convFormat (ln, revGen)
+	content = nil
+	t = nil
+	if ln =~ /^\s*(\d\d\d\d\d\d\d\d\d+\.\d\d\d)(\s|$)/
+		t = Time.at($1.to_f)
+		content = $2 + $'
+	elsif ln =~ /^\s*(\@[0-9a-f]{24})(\s|$)/
+		t = getTai64NSec($1)
+		content = $2 + separateTime($', t)[0]
+	else
+		content, t = separateTime(ln)
+	end
+	if content =~ /^\s*(kernel:\s*|)\[\s*(\d+\.\d\d\d\d\d\d)\]/
+		nt = BTIME + $2.to_f
+		if (d = nt - t).abs < 30
+			t = nt
+			content = " " + $'.lstrip
+		end
+	end
+	if content =~ /\baudit\b/ && content =~ /\((\d\d\d\d\d\d\d\d+\.\d\d\d):(\d+)\)/
+		t = Time.at($1.to_f)
+		content = $` + "(#{$2})" + $'
+	end
+	if content !~ /^(\s|$)/
+		content = " " + content
+	end
+	return TimedContent.new(content, t, revGen)
+end
+
+
+DZNAME = `date +'%Z'`.chomp
+DZDIFF = `date +'%:z'`.chomp
+
+
+def cat2 (a, b)
+	if a =~ /[\,\-\/\:\(\[]+$/
+		a = $`
+	end
+	if b =~ /^[\,\-\/\:\)\]]+/
+		b = $'
+	end
+	cat(a, b)
+end
+
+HOSTNAME = `/usr/bin/hostname`.strip
+HOSTSNAME =  `/usr/bin/hostname -s`.strip
+HREG = /^\s*(#{Regexp.escape HOSTNAME}|#{Regexp.escape HOSTSNAME})\s*/
+AREG =  /^\s*#{Regexp.escape argv[0]}\s*(\[(\d+)\]\s*|)\s*:\s*/
+MONTHS3 = %W{JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC}
+REG_MON3 = MONTHS3.join("|")
+def get_mon arg
+	MONTHS3.index(arg.upcase) + 1
+end
+
+def separateTime (ln, t0 = nil)
+	content = nil
+	t = nil
+	p ln
+	if ln =~ /^(\d\d\d\d)\-(\d\d)\-(\d\d)_(\d\d):(\d\d):(\d\d)\.(\d+)/
+		arr = [$1, $2, $3, $4, $5, $6, $7]
+		if arr[6].size < 6
+			arr[6] += "0" * (6 - arr[6].size)
+		elsif arr[].size > 6
+			arr[6] = arr[6][0..5]
+		end
+		t = Time.local(*arr)
+		p t
+		content = $'
+	elsif ln =~ /\d\d\d\d\-\d\d\-\d\dT\d\d:\d\d:\d\d(\.\d+|)(Z|(\+|\-)\d\d:\d\d|)/
+		t = Time.iso8601($&).getlocal
+		content = $` + $'
+	elsif ln =~ /^(#{REG_MON3})\s+(\d+)\s+(\d\d):(\d\d):(\d\d)/i
+		content = $'
+		t = Time.new(Time.now.year, get_mon($1), $2.to_i, $3.to_i, $4.to_i, $5.to_i)
+		if t > Time.now
+			t = Time.new(Time.now.year - 1, t.mon, t.day, t.hour, t.min, t.sec)
+		end
+	elsif ln =~ /^(\d\d):(\d\d):(\d\d(\.\d\d\d|))\s/
+		content = $'
+		tn = Time.now
+		t = Time.new(tn.year, tn.mon, tn.day, $1.to_i, $2.to_i, $3.to_f)
+		if t > tn
+			t -= 86400
+		end
+	elsif ln =~ /(^|[^\d])((\d{1,2}):(\d\d:(\d\d\.\d+|\d\d)))([^\d]|$)/
+		tzd, tzn, y, mon, wday, ampm = nil, nil, nil, nil, nil, nil
+		y = nil
+		tms = $2
+		content = $6 + $'
+		if content.size > 0 && ":/-\"\',".include?(content[0..0])
+			content = content[1...content.size]
+		end
+		hour = $3.to_i
+		minSec = $4
+		tmsPM = "#{hour + 12}:#{minSec}"
+		pre = $` + $1
+		if pre.size > 0 && ":/-\"\',".include?(pre[-1..-1])
+			pre = pre[0...pre.size-1]
+		end
+		begin
+			tk = TimeTokenizer.new(content)
+			e = nil
+			nonTokenDetected = false
+			tk.each do |e|
+				if y == nil && e.kind == TimeTokenizer::Year
+					y = e.to_s
+				elsif tzd == nil && e.kind == TimeTokenizer::ZDiff
+					tzd = e.to_s
+				elsif tzn == nil && e.kind == TimeTokenizer::ZName
+					tzn = e.to_s
+				elsif ampm == nil && e.kind == TimeTokenizer::Ampm
+					ampm = e.to_s
+				else
+					nonTokenDetected = true
+					content = e.leftSepToEnd
+					break
+				end
+			end
+			if e != nil && !nonTokenDetected
+				content = e.rightSepToEnd
+			end
+		end
+		rt = TimeTokenizer.new(pre)
+		itemArr = []
+		numArr = []
+		rt.reverse_each do |e|
+			if y == nil && e.kind == TimeTokenizer::Year
+				itemArr.push e.setUsed
+				y = e.to_s
+			elsif numArr.size < 3 && e.kind == TimeTokenizer::Number
+				itemArr.push e
+				numArr.push e
+			elsif mon == nil && e.kind == TimeTokenizer::Month
+				itemArr.push e.setUsed
+				mon = e.to_s
+			elsif wday == nil && e.kind == TimeTokenizer::Wday
+				itemArr.push e.setUsed
+				wday = e.to_s
+			else
+				break
+			end
+		end
+		if tzd == nil
+			tzd = tzn
+		end
+		if tzd == nil
+			tzd = ""
+		end
+		if ampm =~ /pm/i
+			tms = tmsPM
+		end
+		if mon == nil && numArr.size >= 2
+			mon = MONTHS[numArr[1].to_s.to_i - 1]
+			numArr[1].setUsed
+		end
+		if y == nil && numArr.size >= 3
+			y = numArr[2].to_i
+			if y < (Time.now.year - 2000)
+				y += 2000
+			else
+				y += 1900
+			end
+			y = y.to_s
+			numArr[2].setUsed
+		end
+		if mon == nil || numArr.size == 0
+			return [ln, Time.at(0)]
+		end
+		numArr[-1].setUsed
+		itemArr.reverse_each do |e|
+			if e.isUsed?
+				pre = e.startToLeftSep
+				break
+			end
+		end
+		if y == nil
+			if $preTime != nil
+				y = $preTime.year
+			else
+				y = Time.now.year
+			end
+		end
+		t = Time.parse("#{mon} #{numArr[0]} #{tms} #{tzd} #{y}").getlocal rescue Time.at(0)
+		if t != Time.at(0)
+			if t - Time.now > 6 * 30 * 24 * 3600 || ($preTime != nil && t - $preTime > 6 * 30 * 24 * 3600)
+				t = Time.parse("#{mon} #{numArr[0]} #{tms} #{tzd} #{y.to_i - 1}").getlocal
+			end
+		end
+		content = cat2(pre, content)
+	else
+		content = ln
+		t = Time.at(0)
+	end
+	if t == Time.at(0) || (t0 != nil && (t0 - t).abs > 1)
+		content = ln
+	end
+	if content =~ HREG
+		content = $'
+	end
+	if content =~ AREG
+		if $1 != ""
+			content = $2 + ": " + $'
+		else
+			content = $'
+		end
+	end
+	p.cyan t, content if content =~ /audit/
+	return [content, t]
+end
+
+
+class MultiGen
+	def initialize
+		@arr = []
+	end
+	def push (gen)
+		if !gen.end?
+			err = false
+			begin
+				gen.current
+			rescue EOFError
+				err = true
+			end
+			if !err
+				@arr.push gen
+				resort
+			end
+		end
+	end
+	def each
+		while @arr.size > 0
+			yield @arr[0].current
+			if @arr[0].next?
+				@arr[0].next
+				begin
+					@arr[0].current
+				rescue EOFError
+					@arr.shift
+				end
+			else
+				@arr.shift
+			end
+			resort
+		end
+	end
+	private
+	def resort
+		@arr.sort! do |a, b|
+			a.current <=> b.current
+		end
+	end
+end
+
+
+class Generator
+	def initialize &prc
+		@enum = Enumerator.new do |y|
+			@yielder = y
+			prc.call self
+		end
+		begin
+			@current = @enum.next
+		rescue StopIteration
+			@no_next = true
+			@end = true
+		else
+			_next
+		end
+	end
+	def _next
+		begin
+			@next = @enum.next
+		rescue StopIteration
+			@no_next = true
+			@next = nil
+		end
+	end
+	def next
+		@current = @next
+		_next
+	end
+	def next?
+		!@no_next
+	end
+	def end?
+		@end
+	end
+	def current
+		@current
+	end
+	def yield v
+		@yielder.yield v
+	end
+end
+
+
+class RevGen
+	def startGen
+		@firstFile = nil
+		#Enumerator::
+		Generator.new do |g|
+			@gen = g
+			iterate
+		end
+	end
+	def initialize (fList)
+		if fList.is_a? Array
+			@repeatConvBuff = Hash.new
+			@condList = []
+			@fArray = fList
+		else
+			@unit = fList
+		end
+	end
+	def gen
+		return @gen
+	end
+	def RevGen.start
+		if !defined?(@@fileList)
+			return nil
+		end
+		@@fileList.each_value do |revGen|
+			revGen.startGen
+		end
+	end
+	def RevGen.each
+		@@fileList.each_value do |revGen|
+			yield revGen
+		end
+	end
+	def RevGen.add (log)
+		p
+		if log =~ /\//
+			stCnt = 1
+			subExists = false
+			fArray = []
+			subName = nil
+			p
+			d = [ "", "log" ].detect{ (log / _1 / "current")._f? }
+			if d
+				shubName = log.basename
+				log = log / d
+			end
+			if d
+				p d
+				p log
+				log.each_entry do |ent|
+					if ent =~ /\/\@[0-9a-f]{24}\.(s|u)$/ || ent =~ /\/current$/
+						fArray.push ent
+					end
+				end
+				fArray = fArray.sort do |a, b|
+					a = a.basename
+					b = b.basename
+					if a == b
+						0
+					else
+						if a == "current"
+							-1
+						elsif b == "current"
+							1
+						else
+							sa = getTai64NSec(a)
+							sb = getTai64NSec(b)
+							sb <=> sa
+						end
+					end
+				end
+				p fArray[0]
+				p fArray[-1]
+			else
+				p
+				if File.file?(tmp = File.dirname(log))
+					p
+					subName = File.basename(log)
+					log = tmp
+				end
+				p
+				if (File.file?(log) && fArray.push(log)) || (File.file?(log + ".0") && eval("stCnt = 0"))
+					p
+					while File.exist?(f = "#{log}.#{stCnt}") || File.exist?(f = "#{log}.#{stCnt}.gz")
+						p
+						fArray.push f
+						stCnt += 1
+						p stCnt
+					end
+					p
+				end
+				p
+				fArray += (log + "-*").glob.sort.reverse
+				p
+			end
+			if !defined? @@fileList
+				@@fileList = Hash.new
+			end
+			if fArray.size > 0
+				s = (@@fileList[fArray[0]] ||= RevGen.new(fArray))
+				if subName != nil
+					p
+					s.pushCond subName
+				else
+					p
+					s.eraseCond
+				end
+			end
+			p
+		else
+			if !defined? @@fileList
+				@@fileList = Hash.new
+			end
+			@@fileList[log] ||= RevGen.new(log)
+		end
+	end
+	def pushCond (subName)
+		if @condList != nil
+			@condList.push subName
+		end
+	end
+	def eraseCond
+		@condList = nil
+	end
+	def iterate
+		if @fArray
+			@fArray.each do |f|
+				revRead(f)
+			end
+			close
+		elsif @unit
+			first = true
+					lnc = 0
+			if !defined? @@genList
+				@@genList = []
+			end
+			@@genList.push self
+			%W{journalctl -a -r -u #{@unit}}.read_each_line_p do |ln|
+				if !first
+					processLine ln do |item|
+						@gen.yield item
+						lnc += 1
+						if lnc == 1000
+							Thread.current.priority = 20
+#							"renice -n 19 -p #{$$} 2>&1 > /dev/null".system
+						end
+						if $thread_slow_down
+							Thread.pass
+							sleep 1
+						end
+#						if lnc > 1000
+#							sleep 0.001
+#						end
+					end
+				else
+					first = false
+				end
+			end
+		end
+	end
+	def close
+		flushBuff
+	end
+	def revRead (f)
+		sz = File.size(f)
+		p f
+		if @firstFile == nil
+			if !defined? @@genList
+				@@genList = []
+			end
+			@@genList.push self
+			@firstFile = f
+			@firstFileSize = sz
+		end
+		fdProc = Proc.new do |fr|
+			i = 1
+			rSz = 1024
+			finish = false
+			while true
+				if sz - 1024 * i < 0
+					rSz = 1024 + (sz - 1024 * i)
+					fr.seek(0)
+					finish = true
+				else
+					fr.seek(sz - 1024 * i)
+				end
+				@buff = fr.read(rSz)
+				p @buff
+				if rSz > 0
+					processBuff
+				end
+				if finish == true
+					p @residue
+					if @residue && !@residue.empty?
+						processLine @residue + "\n" do |item|
+							@gen.yield item
+						end
+					end
+					break
+				end
+				i += 1
+			end
+		end
+		if f =~ /\.gz$/
+			begin
+				temp = "/tmp/#{rand(100000)}.lvw.tmp"
+				"gunzip -c #{f} > #{temp}".system
+				File.open temp, &fdProc
+			ensure
+				temp.unlink
+			end
+		else
+			File.open f, &fdProc
+		end
+		true
+	end
+	def processBuff
+		first = true
+		arr = []
+		@buff.each_line do |ln|
+			arr.unshift ln
+		end
+		if arr[0][-1..-1] != "\n"
+			arr[0] += @residue
+		end
+		@residue = arr.pop
+		lnc = 0
+		arr.each do |e|
+			processLine e do |item|
+				@gen.yield item
+				lnc += 1
+				p lnc if lnc % 100 == 0
+			end
+		end
+	end
+	def flushBuff
+		if @residue != nil
+			processLine @residue do |item|
+				@gen.yield item
+			end
+		end
+	end
+	def processLine (d)
+		p d
+		d = d.rstrip
+		lt = convFormat(d, self)
+		if lt.content =~ /\s*last message repeated (\d+) times/
+			lt.repeat = $1.to_i
+			(@repeatConvBuff[$`] ||= []).push lt
+			return
+		end
+		sz = 0
+		hit = nil
+		b = []
+		if @repeatConvBuff
+			@repeatConvBuff.each_key do |k|
+				if lt.content[0 ... k.size - 1] == k
+					if sz < k
+						sz = k
+						hit = k
+					end
+				end
+			end
+			if hit != nil
+				b = @repeatConvBuff.delete hit
+				b.each do |e|
+					e.content = lt.content
+				end
+			else
+				b = []
+			end
+		end
+		b.push lt
+		b.each do |e|
+			if @condList != nil
+				@condList.each do |cond|
+					if e.content =~ /(^|\s)#{Regexp.escape(cond)}(\[\d+\]|):(\s|$)/
+						yield e
+					end
+				end
+			else
+				yield e
+			end
+		end
+	end
+	def RevGen.stopAppendWatch
+		@@appendTerminate = true
+		if defined? @@appendWatchThread
+			@@appendWatchThread.run
+			@@appendWatchThread.join
+		end
+	end
+	def RevGen.startAppendWatch
+		if !defined? @@genList
+			return
+		end
+		if false
+			@@appendTerminate = false
+			@@appendWatchThread = Thread.new do
+				while true
+					@@appendList = []
+					@@appendTerminate && break
+					sleep $watchInterval
+					@@appendTerminate && break
+					@@genList.each do |e|
+						e.checkAppend	
+					end
+					@@appendList.sort!
+					yield @@appendList
+				end
+			end
+		else
+			frs = {}
+			@@genList.each do |e|
+				e.setTailer frs
+			end
+			@@appendList = []
+			Thread.new do
+				begin
+					loop do
+						rs, = IO.select frs.keys
+						if rs && rs.size >= 0
+							r = rs.shuffle[0]
+							frs[r].readAppend
+							@@appendList.sort!
+							yield @@appendList
+							@@appendList.clear
+						end
+					end
+				rescue EOFError
+				ensure
+					if $!
+						STDERR.write $!.to_s.ln
+						STDERR.write $!.backtrace_locations.join("\n").ln
+					end
+				end
+			end
+		end
+	end
+	def getFContent (f, l)
+		File.open f do |fr|
+			fr.seek l
+			return fr.read
+		end
+	end
+	def getPrevName (f)
+		arr = getFileList(f)
+		if arr.size > 1
+			arr[1]
+		else
+			""
+		end
+	end
+	def checkAppend
+		diff = File.size(@firstFile) - @firstFileSize
+		c = nil
+		if diff > 0
+			c = getFContent(@firstFile, @firstFileSize)
+		elsif diff < 0
+			if File.exist?(pFile = getPrevName(@fistFile))
+				c = getFContent(pFile, @firstFileSize)
+			end
+			c += getFContent(@firstFile, 0)
+		else
+			return
+		end
+		c.each_line do |ln|
+			processLine ln do |item|
+				@@appendList.push item
+			end
+		end
+		@firstFileSize += diff
+	end
+	def setTailer frs
+		@abuff = ""
+		fr, fw = IO.pipe
+		@pid = fork do
+			STDOUT.reopen fw
+			STDERR.reopen fw
+			fr.close
+			if !@unit
+				exec "tail -F -c 0 #{@firstFile}"
+			else
+				exec "journalctl -a -n 0 -f -u #{@unit}"
+			end
+		end
+		fw.close
+		if @unit
+			fr.readline
+		end
+		frs[fr] = self
+		@fr = fr
+	end
+	def readAppend
+		@abuff += @fr.readpartial 4096
+		while @abuff =~ /\n/
+			processLine $` + $& do |item|
+				@@appendList.push item
+			end
+			@abuff = $'
+		end
+	end
+end
+
+
+require 'monitor'
+
+
+class Lines
+	def initialize (*cue)
+		@m = Monitor.new
+		@pushClosed = false
+		@lines = []
+		@top = nil
+		@max = nil
+	end
+	def Lines.open
+		Lines.new
+	end
+	def each
+		@lines.each do |e|
+			yield e
+		end
+	end
+	def max
+		@max
+	end
+	def min
+		@top
+	end
+	def size
+		@lines.size
+	end
+	def [] (n)
+		return @lines[n - @top]
+	end
+	def push (*items)
+		if @pushClosed
+			raise "push has been already closed!"
+		end
+		@m.synchronize do
+			@cuef = items[0].class.cuef
+			@cuef.push *items
+			_push *@cuef.shifts
+		end
+	end
+	def unshift (*items)
+		@m.synchronize do
+			@cueb = items[0].class.cueb
+			@cueb.push *items
+			_unshift *@cueb.shifts
+			_unshift *@cueb.shift_lefts
+		end
+	end
+	def closePush
+		@m.synchronize do
+			if @cuef != nil
+				_push *@cuef.shift_lefts
+			end
+			@pushClosed = true
+		end
+	end
+	private
+	def _unshift (*items)
+		if items.size > 0
+			@lines.unshift *items
+			if @top == nil
+				@top = 0
+				@max = -1
+			end
+			@top -= items.size
+		end
+	end
+	def _push (*items)
+		if items.size > 0
+			@lines.push *items
+			if @top == nil
+				@top = 0
+				@max = -1
+			end
+			@max += items.size
+		end
+	end
+end
+
+
+p
+if argv[0] != nil
+	p
+	mg = MultiGen.new
+	h = Hash.new
+	lst = []
+	jlst = []
+	argv.each do |e|
+		if e.relative? and
+			:found == SEARCH_PATH.each do |d|
+				if (pth = d / e)._e?
+					p pth
+					lst.push pth
+					break :found
+				end
+			end
+		elsif e._e?
+        	lst.push e.expand_path
+			next
+		elsif e !~ /\//
+			jlst.push e
+		end
+	end
+	p
+	lst.each do |tmp|
+		if tmp._d? || ((ol = tmp.readline) !~  /^\#\!/ && ol !~ /\x00/)
+			p
+			rg = RevGen.add(tmp)
+			p
+		end
+	end
+	p
+	jlst.each{|e| RevGen.add e}
+	if !RevGen.start
+		STDERR.write "Error:could not find any file.\n"
+		exit 1
+	end
+	p
+	RevGen.each do |rg|
+		mg.push rg.gen
+	end
+	lines = Lines.open
+	RevGen.startAppendWatch do |items|
+		if items.size > 0
+			p items
+			lines.unshift *items.reverse
+		end
+	end
+	cw = nil
+	i = 0
+	p
+	begin
+		begin
+			p
+			cw = NcursesCon.new(lines)
+			p
+			t = Time.now
+			mg.each do |lt|
+				p
+				lines.push lt
+				i += 1
+				if lt.time != Time.at(0)
+					$preTime = lt.time
+				end
+				if cw.terminated?
+					break
+				end
+			end
+		#rescue => e
+		#	STDERR.write "#{$@.shift}:#{e} (#{e.class}.)\n"
+		#	$@.each do |e|
+		#		STDERR.write "\t#{e}\n"
+		#	end
+		#	abort
+		end
+	ensure
+		lines.closePush
+		cw.join
+		RevGen.stopAppendWatch
+	end
+end
+
+
+
+
