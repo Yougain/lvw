@@ -16,7 +16,9 @@ END{
 	end
 }
 
-p > "./lvw.debug"
+if $debug
+	p > "./lvw.debug"
+end
 
 HILIGHT_START = "\x1b[7m"
 HILIGHT_END = "\x1b[27m"
@@ -1342,8 +1344,15 @@ end
 
 
 TERMUX_PATH = "/data/data/com.termux/files"
+R = TERMUX_PATH._e? ? TERMUX_PATH / "usr" : ""
 
-SEARCH_PATH = ["/var/log", "/var/service_log", TERMUX_PATH + "/usr/var/log/sv", TERMUX_PATH + "/usr/var/service", TERMUX_PATH + "/usr/var/log", "./"]
+SEARCH_PATH = %W{
+	#{R}/var/log
+	#{R}/var/service/*/log
+	#{R}/var/log/sv
+	#{R}/var/service_log
+	./
+}
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 		  "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
           "Januruary", "February", "March", "April", "May", "June", "July", "August", "September", 
@@ -2044,16 +2053,23 @@ def separateTime (ln, t0 = nil)
 	content = nil
 	t = nil
 	p ln
-	if ln =~ /^(\d\d\d\d)\-(\d\d)\-(\d\d)_(\d\d):(\d\d):(\d\d)\.(\d+)/
-		arr = [$1, $2, $3, $4, $5, $6, $7]
+	if ln =~ /^(\d\d|\d\d\d\d)\-(\d\d)\-(\d\d)(_| )(\d\d):(\d\d):(\d\d)(\.(\d+)|)/
+		arr = [$1, $2, $3, $5, $6, $7, $8]
 		if arr[6].size < 6
 			arr[6] += "0" * (6 - arr[6].size)
-		elsif arr[].size > 6
+		elsif arr[6].size > 6
 			arr[6] = arr[6][0..5]
+		end
+		if arr[0].size == 2
+			if arr[0].to_i < 70
+				arr[0] = "20" + arr[0]
+			else
+				arr[0] = "19" + arr[0]
+			end
 		end
 		t = Time.local(*arr)
 		p t
-		content = $'
+		content = $'.strip
 	elsif ln =~ /\d\d\d\d\-\d\d\-\d\dT\d\d:\d\d:\d\d(\.\d+|)(Z|(\+|\-)\d\d:\d\d|)/
 		t = Time.iso8601($&).getlocal
 		content = $` + $'
@@ -2782,7 +2798,10 @@ if argv[0] != nil
 				if (pth = d / e)._e?
 					p pth
 					lst.push pth
-					break :found
+				elsif d =~ /\/\*\//
+					if (pth = $` / e / $')._e?
+						lst.push pth
+					end
 				end
 			end
 		elsif e._e?
@@ -2794,7 +2813,11 @@ if argv[0] != nil
 	end
 	p
 	lst.each do |tmp|
-		if tmp._d? || ((ol = tmp.readline) !~  /^\#\!/ && ol !~ /\x00/)
+		if tmp._d?
+			if (tmp / "current")._r? || tmp.entries.detect{ _1.basename =~ /^\@[0-9a-f]{24}\.(s|u)$/ }&._r?
+				rg = RevGen.add(tmp)
+			end
+		elsif tmp._r? && tmp.file_size != 0 && (((ol = tmp.readline rescue "\x00") !~  /^\#\!/ && ol !~ /\x00/) rescue nil)
 			p
 			rg = RevGen.add(tmp)
 			p
